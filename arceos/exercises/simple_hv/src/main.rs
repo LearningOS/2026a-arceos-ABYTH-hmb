@@ -23,11 +23,18 @@ use tock_registers::LocalRegisterCopy;
 use csrs::{RiscvCsrTrait, CSR};
 use vcpu::_run_guest;
 use sbi::SbiMessage;
-use loader::load_vm_image;
+use loader::{load_vm_image, GUEST_HARTID};
 use axhal::mem::PhysAddr;
-use crate::regs::GprIndex::{A0, A1};
+use crate::regs::GprIndex::{self, A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
+
+/// Exception code of the virtual instruction exception per the RISC-V
+/// privilege specification (guest accesses to M-mode CSRs from VS-mode).
+const EXC_VIRTUAL_INSTRUCTION: usize = 20;
+
+/// CSR address of `mhartid`.
+const CSR_MHARTID: usize = 0xf14;
 
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
@@ -75,6 +82,38 @@ fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
     vmexit_handler(ctx)
 }
 
+/// Reads the `htinst` CSR, which contains the trapped instruction encoding
+/// (or a standard pseudo-encoding) on a guest trap.
+fn read_htinst() -> usize {
+    let v: usize;
+    unsafe {
+        core::arch::asm!("csrr {}, htinst", out(reg) v);
+    }
+    v
+}
+
+/// Emulates a guest `csrr rd, mhartid` trap: writes the emulated hart id
+/// into the destination register and advances `sepc` past the instruction.
+fn emulate_csrr_mhartid(ctx: &mut VmCpuRegisters, htinst: usize) {
+    if htinst == 0 {
+        // No instruction encoding available; the only CSR access the guest
+        // performs is `csrr a1, mhartid`.
+        ctx.guest_regs.gprs.set_reg(A1, GUEST_HARTID);
+    } else {
+        let csr = (htinst >> 20) & 0xfff;
+        let rd = ((htinst >> 7) & 0x1f) as u32;
+        if csr != CSR_MHARTID {
+            panic!("Unsupported guest CSR access: {csr:#x} (htinst: {htinst:#x})");
+        }
+        if let Some(reg) = GprIndex::from_raw(rd) {
+            ctx.guest_regs.gprs.set_reg(reg, GUEST_HARTID);
+        } else {
+            panic!("Bad destination register for CSR access: {rd}");
+        }
+    }
+    ctx.guest_regs.sepc += 4;
+}
+
 #[allow(unreachable_code)]
 fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
     use scause::{Exception, Trap};
@@ -101,17 +140,49 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                 panic!("bad sbi message! ");
             }
         },
-        Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
+        Trap::Exception(Exception::InstructionGuestPageFault) => {
+            // NOTE: the rcore-os riscv crate maps exception code 20 to
+            // `InstructionGuestPageFault`, but code 20 is the *virtual
+            // instruction* exception per the RISC-V privilege spec. The
+            // guest's `csrr a1, mhartid` traps here (accessing an M-mode
+            // CSR from VS-mode). Emulate the CSR read and resume.
+            let htinst = read_htinst();
+            ax_println!(
+                "VmExit Reason: VirtualInstruction (sepc: {:#x}, htinst: {htinst:#x})",
                 ctx.guest_regs.sepc
             );
+            emulate_csrr_mhartid(ctx, htinst);
+        },
+        Trap::Exception(Exception::IllegalInstruction) => {
+            // QEMU reports an illegal instruction (not a virtual
+            // instruction exception) when the guest reads `mhartid` from
+            // VS-mode. `stval` holds the trapping instruction encoding, so
+            // we can identify `csrr rd, mhartid` and emulate it.
+            let ins = stval::read();
+            let csr = (ins >> 20) & 0xfff;
+            let funct3 = (ins >> 12) & 0b111;
+            let opcode = ins & 0x7f;
+            if opcode == 0x73 && funct3 == 2 && csr == CSR_MHARTID {
+                ax_println!("VmExit Reason: IllegalInstruction (guest csrr mhartid), emulated");
+                let rd = ((ins >> 7) & 0x1f) as u32;
+                if let Some(reg) = GprIndex::from_raw(rd) {
+                    ctx.guest_regs.gprs.set_reg(reg, GUEST_HARTID);
+                }
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!("Bad instruction: {:#x} sepc: {:#x}", ins, ctx.guest_regs.sepc);
+            }
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
             panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
+        },
+        Trap::Interrupt(_) => {
+            // Interrupts are disabled while the guest runs, but just in
+            // case one slips through, resume the guest without servicing.
+            ax_println!("VmExit Reason: interrupt ignored");
         },
         _ => {
             panic!(
@@ -140,6 +211,11 @@ fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set sstatus in guest mode.
     let mut sstatus = sstatus::read();
     sstatus.set_spp(sstatus::SPP::Supervisor);
+    // Disable HS-level interrupts while running the guest: the guest only
+    // executes a handful of instructions and returns immediately. Otherwise
+    // a timer interrupt would trap into our VM-exit handler, which does not
+    // (and must not) service ArceOS scheduler preemption.
+    sstatus.set_sie(false);
     ctx.guest_regs.sstatus = sstatus.bits();
     // Return to entry to start vm.
     ctx.guest_regs.sepc = VM_ENTRY;

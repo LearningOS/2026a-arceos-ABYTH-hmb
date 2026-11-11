@@ -3,10 +3,12 @@
 use core::ffi::{c_void, c_char, c_int};
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
+use axhal::mem::PAGE_SIZE_4K;
+use axhal::paging::MappingFlags;
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
+use memory_addr::{VirtAddr, VirtAddrRange};
 use arceos_posix_api as api;
 
 const SYS_IOCTL: usize = 29;
@@ -131,7 +133,8 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
+/// `mmap` syscall: map the given file (or anonymous memory) into the current
+/// user address space and return the mapped virtual address.
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
@@ -140,7 +143,76 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+    let prot_flags = MappingFlags::from(MmapProt::from_bits_truncate(prot));
+    let map_flags = MmapFlags::from_bits_truncate(flags);
+    let map_size = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+
+    // Choose a virtual address for the new mapping. The user stack is mapped
+    // right below the end of the address space, so keep away from it.
+    let limit = VirtAddrRange::from_start_size(
+        aspace.base(),
+        aspace.end().as_usize() - crate::USER_STACK_SIZE - aspace.base().as_usize(),
+    );
+    let vaddr = if map_flags.contains(MmapFlags::MAP_FIXED) {
+        VirtAddr::from(addr as usize)
+    } else {
+        let hint = if addr.is_null() {
+            VirtAddr::from(0x400_0000)
+        } else {
+            VirtAddr::from(addr as usize)
+        };
+        match aspace.find_free_area(hint, map_size, limit) {
+            Some(a) => a,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    if aspace
+        .map_alloc(
+            vaddr,
+            map_size,
+            MappingFlags::USER | prot_flags,
+            true, // populate: map and allocate all pages up front
+        )
+        .is_err()
+    {
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // Fill in the contents: zero pages for anonymous mappings, or the file
+    // contents read through the POSIX fd table for file-backed mappings.
+    if map_flags.contains(MmapFlags::MAP_ANONYMOUS) || fd < 0 {
+        let zeros = alloc::vec![0u8; map_size];
+        if aspace.write(vaddr, &zeros).is_err() {
+            return -LinuxError::EFAULT.code() as isize;
+        }
+    } else {
+        let mut buf = alloc::vec![0u8; length];
+        let n = api::sys_read(fd, buf.as_mut_ptr() as *mut c_void, length);
+        if n < 0 {
+            return n;
+        }
+        if n > 0 && aspace.write(vaddr, &buf[..n as usize]).is_err() {
+            return -LinuxError::EFAULT.code() as isize;
+        }
+    }
+
+    ax_println!(
+        "sys_mmap: mapped [{:#x}, {:#x}) size={:#x} prot={:#b} flags={:#b} fd={}",
+        vaddr.as_usize(),
+        vaddr.as_usize() + map_size,
+        map_size,
+        prot,
+        flags,
+        fd
+    );
+    vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

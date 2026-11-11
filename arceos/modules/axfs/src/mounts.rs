@@ -17,8 +17,9 @@ pub(crate) fn devfs() -> Arc<fs::devfs::DeviceFileSystem> {
 }
 
 #[cfg(feature = "ramfs")]
-pub(crate) fn ramfs() -> Arc<fs::ramfs::RamFileSystem> {
-    Arc::new(fs::ramfs::RamFileSystem::new())
+pub(crate) fn ramfs() -> Arc<fs::myramfs::RamFileSystem> {
+    // Use the rename-capable RAM filesystem for /tmp.
+    Arc::new(fs::myramfs::RamFileSystem::new())
 }
 
 #[cfg(feature = "procfs")]
